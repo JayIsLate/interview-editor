@@ -245,25 +245,20 @@ def render_sidebar():
     st.sidebar.markdown("---")
 
     # OpenAI API settings
-    st.sidebar.subheader("Transcription (OpenAI API)")
-
-    # Check for API key in secrets first, then allow manual input
+    st.sidebar.subheader("Transcription")
+    use_api = st.sidebar.toggle("Use OpenAI API (faster, paid)", value=False, help="OFF = Free local Whisper. ON = API (~$0.006/min).")
     api_key = None
-    if hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
-        api_key = st.secrets['OPENAI_API_KEY']
-        st.sidebar.success("API key loaded from secrets")
-    else:
-        api_key = st.sidebar.text_input(
-            "OpenAI API Key",
-            type="password",
-            help="Get your API key from platform.openai.com. Cost: ~$0.006/min of audio.",
-            placeholder="sk-..."
-        )
+    whisper_model = "base"
+    if use_api:
+        st.sidebar.caption("API: Fast, ~$0.006/min")
+        try: api_key = st.secrets.get("OPENAI_API_KEY")
+        except: pass
         if not api_key:
-            st.sidebar.warning("Enter your OpenAI API key to enable transcription")
-
-    # Keep whisper_model for compatibility (not used by API)
-    whisper_model = "whisper-1"
+            api_key = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+            if not api_key: st.sidebar.warning("Enter API key")
+    else:
+        st.sidebar.caption("Local: Free, runs on your CPU")
+        whisper_model = st.sidebar.selectbox("Model", ["tiny","base","small","medium","large"], index=1)
 
     # Export settings
     st.sidebar.subheader("Export")
@@ -289,7 +284,7 @@ def render_sidebar():
         "min_cut_duration": default_min_cut,
         "whisper_model": whisper_model,
         "frame_rate": frame_rate,
-        "api_key": api_key,
+        "api_key": api_key, "use_api": use_api,
     }
 
 
@@ -317,7 +312,7 @@ def process_video(video_path, settings, progress_callback=None):
     transcriber = Transcriber(
         model_name=settings["whisper_model"],
         language="en",
-        api_key=settings.get("api_key")
+        api_key=settings.get("api_key"), use_api=settings.get("use_api", False)
     )
 
     if progress_callback:
@@ -1177,7 +1172,7 @@ def main():
         st.markdown("Click below to scan your video for silence, filler words, and pauses.")
 
         # Check for API key before allowing analysis
-        if not settings.get("api_key"):
+        if settings.get("use_api") and not settings.get("api_key"):
             st.warning("Please enter your OpenAI API key in the sidebar to analyze videos.")
             st.info("Get your API key at [platform.openai.com](https://platform.openai.com/api-keys). Cost: ~$0.006 per minute of audio.")
             analyze_disabled = True
