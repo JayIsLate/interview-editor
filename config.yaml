@@ -1,0 +1,50 @@
+# Interview Auto-Editor Configuration
+
+# Silence Detection Settings
+silence:
+  min_duration: 0.8      # Minimum silence length (seconds) to flag as a cut
+  threshold_db: -40      # Audio level (dB) below which is considered silence
+
+# Filler Word Detection
+filler_words:
+  - um
+  - uh
+  - uhm
+  - uhh
+  - like
+  - you know
+  - basically
+  - actually
+  - literally
+  - so
+  - right
+  - i mean
+
+# Cut Settings
+cuts:
+  padding: 0.1           # Buffer (seconds) around cuts to avoid harsh jumps
+  merge_gap: 0.3         # Merge cuts that are within this many seconds of each other
+
+# Whisper Settings
+whisper:
+  model: base            # Options: tiny, base, small, medium, large
+  language: en           # Language code (null for auto-detect)
+
+# False Start Detection
+false_starts:
+  enabled: true            # Detect sentence restarts (word repetitions, phrase restarts)
+  auto_approve: false      # false = flagged for review, not auto-cut
+
+# Off-Mic Speech Detection
+offmic:
+  enabled: false
+  sensitivity_db: 10
+  chunk_size_ms: 200
+  min_duration: 0.8
+  merge_gap: 0.5
+  percentile: 75
+  auto_approve: true
+
+# Export Settings
+export:
+  frame_rate: 29.97      # Video frame rate for XML export
