@@ -1,289 +1,98 @@
 """
-Transcriber module using OpenAI Whisper API for speech-to-text.
+Transcriber module supporting both local Whisper and OpenAI Whisper API.
 """
-
 import tempfile
 import os
+import sys
+import io
 from pydub import AudioSegment
 from typing import Optional
-from openai import OpenAI
-
 
 class Transcriber:
-    """Handles audio transcription using OpenAI Whisper API."""
-
-    # Maximum file size for OpenAI API (25 MB)
     MAX_FILE_SIZE = 25 * 1024 * 1024
-
-    def __init__(self, model_name: str = "base", language: Optional[str] = "en", api_key: Optional[str] = None):
-        """
-        Initialize the transcriber.
-
-        Args:
-            model_name: Ignored for API (kept for compatibility)
-            language: Language code or None for auto-detection
-            api_key: OpenAI API key (optional, will use env var if not provided)
-        """
-        self.model_name = model_name  # Kept for compatibility, not used with API
+    def __init__(self, model_name="base", language="en", api_key=None, use_api=False):
+        self.model_name = model_name
         self.language = language
         self.api_key = api_key
+        self.use_api = use_api
         self._client = None
-
+        self._local_model = None
     @property
     def client(self):
-        """Get or create the OpenAI client."""
-        if self._client is None:
+        if self._client is None and self.use_api:
+            from openai import OpenAI
             self._client = OpenAI(api_key=self.api_key) if self.api_key else OpenAI()
         return self._client
-
-    def extract_audio(self, video_path: str) -> str:
-        """
-        Extract audio from video file.
-
-        Args:
-            video_path: Path to the video file
-
-        Returns:
-            Path to the extracted audio file (MP3 format for smaller size)
-        """
+    def _load_local_model(self):
+        if self._local_model is None:
+            import whisper
+            self._local_model = whisper.load_model(self.model_name)
+        return self._local_model
+    def extract_audio(self, video_path, for_api=False):
         audio = AudioSegment.from_file(video_path)
-
-        # Create temp file for audio - use MP3 for smaller file size
-        temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        suffix = ".mp3" if for_api else ".wav"
+        temp_audio = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
         temp_audio.close()
-
-        # Export as MP3 with reasonable quality (smaller than WAV)
-        audio.export(temp_audio.name, format="mp3", bitrate="128k")
-
-        return temp_audio.name
-
-    def _transcribe_chunk(self, audio_path: str) -> dict:
-        """
-        Transcribe a single audio file using the OpenAI API.
-
-        Args:
-            audio_path: Path to audio file (must be under 25 MB)
-
-        Returns:
-            API response with transcription
-        """
-        with open(audio_path, "rb") as audio_file:
-            kwargs = {
-                "model": "whisper-1",
-                "file": audio_file,
-                "response_format": "verbose_json",
-                "timestamp_granularities": ["word", "segment"],
-            }
-            if self.language:
-                kwargs["language"] = self.language
-
-            response = self.client.audio.transcriptions.create(**kwargs)
-
-        return response
-
-    def transcribe(self, audio_path: str) -> dict:
-        """
-        Transcribe audio file using OpenAI Whisper API.
-
-        Args:
-            audio_path: Path to audio file
-
-        Returns:
-            Transcription result with word-level timestamps (compatible with local Whisper format)
-        """
-        file_size = os.path.getsize(audio_path)
-
-        if file_size <= self.MAX_FILE_SIZE:
-            # File is small enough, transcribe directly
-            response = self._transcribe_chunk(audio_path)
-            return self._convert_api_response(response)
+        if for_api:
+            audio.export(temp_audio.name, format="mp3", bitrate="128k")
         else:
-            # File too large, need to split into chunks
-            return self._transcribe_large_file(audio_path)
-
-    def _transcribe_large_file(self, audio_path: str) -> dict:
-        """
-        Transcribe a large audio file by splitting it into chunks.
-
-        Args:
-            audio_path: Path to audio file
-
-        Returns:
-            Combined transcription result
-        """
+            audio.export(temp_audio.name, format="wav")
+        return temp_audio.name
+    def _transcribe_local(self, audio_path):
+        model = self._load_local_model()
+        options = {"word_timestamps": True, "verbose": False}
+        if self.language: options["language"] = self.language
+        old_stderr, sys.stderr = sys.stderr, io.StringIO()
+        try: result = model.transcribe(audio_path, **options)
+        finally: sys.stderr = old_stderr
+        return result
+    def _transcribe_chunk_api(self, audio_path):
+        with open(audio_path, "rb") as f:
+            kwargs = {"model": "whisper-1", "file": f, "response_format": "verbose_json", "timestamp_granularities": ["word", "segment"]}
+            if self.language: kwargs["language"] = self.language
+            return self.client.audio.transcriptions.create(**kwargs)
+    def _transcribe_api(self, audio_path):
+        if os.path.getsize(audio_path) <= self.MAX_FILE_SIZE:
+            return self._convert_api_response(self._transcribe_chunk_api(audio_path))
+        return self._transcribe_large_file_api(audio_path)
+    def _transcribe_large_file_api(self, audio_path):
         audio = AudioSegment.from_file(audio_path)
-        duration_ms = len(audio)
-
-        # Calculate chunk duration to stay under 25 MB
-        # Estimate: 128kbps MP3 = ~1 MB per minute, so ~20 minutes per chunk to be safe
-        chunk_duration_ms = 15 * 60 * 1000  # 15 minutes per chunk
-
-        all_segments = []
-        all_words = []
-        full_text_parts = []
-        time_offset = 0.0
-
-        chunk_index = 0
-        while chunk_index * chunk_duration_ms < duration_ms:
-            start_ms = chunk_index * chunk_duration_ms
-            end_ms = min((chunk_index + 1) * chunk_duration_ms, duration_ms)
-
-            # Extract chunk
-            chunk = audio[start_ms:end_ms]
-
-            # Save chunk to temp file
-            temp_chunk = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-            temp_chunk.close()
-            chunk.export(temp_chunk.name, format="mp3", bitrate="128k")
-
+        duration_ms, chunk_ms = len(audio), 15*60*1000
+        all_segments, all_words, texts, offset = [], [], [], 0.0
+        i = 0
+        while i * chunk_ms < duration_ms:
+            chunk = audio[i*chunk_ms:min((i+1)*chunk_ms, duration_ms)]
+            tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            tmp.close()
+            chunk.export(tmp.name, format="mp3", bitrate="128k")
             try:
-                # Transcribe chunk
-                response = self._transcribe_chunk(temp_chunk.name)
-
-                # Add text
-                full_text_parts.append(response.text)
-
-                # Adjust timestamps and add words
-                if hasattr(response, 'words') and response.words:
-                    for word in response.words:
-                        all_words.append({
-                            "word": word.word,
-                            "start": word.start + time_offset,
-                            "end": word.end + time_offset,
-                        })
-
-                # Adjust timestamps and add segments
-                if hasattr(response, 'segments') and response.segments:
-                    for segment in response.segments:
-                        seg_dict = {
-                            "start": segment.start + time_offset,
-                            "end": segment.end + time_offset,
-                            "text": segment.text,
-                            "words": [],
-                        }
-                        # Add words to segment if available
-                        if hasattr(segment, 'words') and segment.words:
-                            for word in segment.words:
-                                seg_dict["words"].append({
-                                    "word": word.word,
-                                    "start": word.start + time_offset,
-                                    "end": word.end + time_offset,
-                                })
-                        all_segments.append(seg_dict)
-
+                r = self._transcribe_chunk_api(tmp.name)
+                texts.append(r.text)
+                if hasattr(r,'words') and r.words:
+                    all_words.extend([{"word":w.word,"start":w.start+offset,"end":w.end+offset} for w in r.words])
+                if hasattr(r,'segments') and r.segments:
+                    all_segments.extend([{"start":s.start+offset,"end":s.end+offset,"text":s.text,"words":[]} for s in r.segments])
             finally:
-                # Clean up chunk file
-                if os.path.exists(temp_chunk.name):
-                    os.unlink(temp_chunk.name)
-
-            time_offset = end_ms / 1000.0  # Convert to seconds
-            chunk_index += 1
-
-        # Combine results
-        return {
-            "text": " ".join(full_text_parts),
-            "segments": all_segments,
-            "words": all_words,
-        }
-
-    def _convert_api_response(self, response) -> dict:
-        """
-        Convert OpenAI API response to local Whisper-compatible format.
-
-        Args:
-            response: OpenAI API transcription response
-
-        Returns:
-            Dict matching local Whisper output format
-        """
-        segments = []
-
-        # Convert segments
-        if hasattr(response, 'segments') and response.segments:
-            for segment in response.segments:
-                seg_dict = {
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text,
-                    "words": [],
-                }
-                # API doesn't nest words in segments, but we'll populate from top-level words
-                segments.append(seg_dict)
-
-        # Get words from top-level (API format)
-        words = []
-        if hasattr(response, 'words') and response.words:
-            for word in response.words:
-                words.append({
-                    "word": word.word,
-                    "start": word.start,
-                    "end": word.end,
-                })
-
-        # Assign words to segments based on timestamps
-        for segment in segments:
-            segment["words"] = [
-                w for w in words
-                if w["start"] >= segment["start"] and w["end"] <= segment["end"]
-            ]
-
-        return {
-            "text": response.text,
-            "segments": segments,
-            "words": words,  # Also keep at top level for convenience
-        }
-
-    def transcribe_video(self, video_path: str) -> dict:
-        """
-        Extract audio from video and transcribe.
-
-        Args:
-            video_path: Path to video file
-
-        Returns:
-            Whisper transcription result
-        """
-        # Extract audio
-        audio_path = self.extract_audio(video_path)
-
-        try:
-            # Transcribe
-            result = self.transcribe(audio_path)
-            return result
+                if os.path.exists(tmp.name): os.unlink(tmp.name)
+            offset = min((i+1)*chunk_ms, duration_ms)/1000.0
+            i += 1
+        return {"text":" ".join(texts),"segments":all_segments,"words":all_words}
+    def _convert_api_response(self, r):
+        segments = [{"start":s.start,"end":s.end,"text":s.text,"words":[]} for s in (r.segments or [])] if hasattr(r,'segments') else []
+        words = [{"word":w.word,"start":w.start,"end":w.end} for w in (r.words or [])] if hasattr(r,'words') else []
+        for seg in segments: seg["words"]=[w for w in words if w["start"]>=seg["start"] and w["end"]<=seg["end"]]
+        return {"text":r.text,"segments":segments,"words":words}
+    def transcribe(self, audio_path):
+        return self._transcribe_api(audio_path) if self.use_api else self._transcribe_local(audio_path)
+    def transcribe_video(self, video_path):
+        audio_path = self.extract_audio(video_path, for_api=self.use_api)
+        try: return self.transcribe(audio_path)
         finally:
-            # Clean up temp file
-            if os.path.exists(audio_path):
-                os.unlink(audio_path)
-
-    def get_word_timestamps(self, transcription: dict) -> list:
-        """
-        Extract word-level timestamps from transcription.
-
-        Args:
-            transcription: Whisper transcription result
-
-        Returns:
-            List of dicts with word, start, and end times
-        """
+            if os.path.exists(audio_path): os.unlink(audio_path)
+    def get_word_timestamps(self, transcription):
         words = []
-
-        # First try top-level words (API format)
-        if "words" in transcription and transcription["words"]:
-            for word_info in transcription["words"]:
-                words.append({
-                    "word": word_info.get("word", "").strip(),
-                    "start": word_info.get("start", 0),
-                    "end": word_info.get("end", 0),
-                })
-            return words
-
-        # Fall back to segment-nested words (local Whisper format)
-        for segment in transcription.get("segments", []):
-            for word_info in segment.get("words", []):
-                words.append({
-                    "word": word_info.get("word", "").strip(),
-                    "start": word_info.get("start", 0),
-                    "end": word_info.get("end", 0),
-                })
-
+        if transcription.get("words"):
+            return [{"word":w.get("word","").strip(),"start":w.get("start",0),"end":w.get("end",0)} for w in transcription["words"]]
+        for seg in transcription.get("segments",[]):
+            words.extend([{"word":w.get("word","").strip(),"start":w.get("start",0),"end":w.get("end",0)} for w in seg.get("words",[])])
         return words
